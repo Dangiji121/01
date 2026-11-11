@@ -1,0 +1,339 @@
+/***** BLOGGER THEME LICENSE SYSTEM — UPDATED BACKEND *****/
+const CFG = {
+  SHEET_NAME: 'Licenses',
+  LOG_SHEET: 'ActivityLog',
+  HEADERS: ['KeyHash','KeyLast4','CustomerName','Email','ProductScope','Domain','Status','CreatedAt','ExpiryAt','ActivatedAt','LastVerifiedAt','Notes','Phone','Company','OrderID','Plan','ActivationCount','LastDomainSeen','LastUserAgent','LastPageURL','LastLanguage','LastTimezone'],
+  SESSION_SECONDS: 21600
+};
+
+/** Serves Admin.html or the public JSON/JSONP domain-license endpoint. */
+function doGet(e) {
+  const p = (e && e.parameter) || {};
+  if (!p.action) {
+    return HtmlService.createHtmlOutputFromFile('Admin')
+      .setTitle('Theme License Admin')
+      .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+  }
+  let result;
+  try {
+    result = publicAction_(p);
+  } catch (err) {
+    console.error(err && err.stack ? err.stack : err);
+    result = {ok:false, message:'SERVER_ERROR: ' + String(err && err.message ? err.message : err)};
+  }
+  const json = JSON.stringify(result);
+  const cb = String(p.callback || '');
+  if (cb && /^[A-Za-z_$][0-9A-Za-z_$\.]*$/.test(cb)) {
+    return ContentService.createTextOutput(cb + '(' + json + ');')
+      .setMimeType(ContentService.MimeType.JAVASCRIPT);
+  }
+  return ContentService.createTextOutput(json).setMimeType(ContentService.MimeType.JSON);
+}
+
+/** Run once from the Apps Script editor. */
+function setupSystem() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  if (!ss) throw new Error('इस Apps Script को Google Sheet के साथ खोलकर setupSystem() चलाएँ।');
+  PropertiesService.getScriptProperties().setProperty('LICENSE_SPREADSHEET_ID', ss.getId());
+  let sh = ss.getSheetByName(CFG.SHEET_NAME);
+  if (!sh) sh = ss.insertSheet(CFG.SHEET_NAME);
+  ensureHeaders_(sh, CFG.HEADERS);
+  let log = ss.getSheetByName(CFG.LOG_SHEET);
+  if (!log) log = ss.insertSheet(CFG.LOG_SHEET);
+  ensureHeaders_(log, ['Timestamp','Event','LicenseLast4','CustomerName','Email','Domain','Status','PageURL','UserAgent','Language','Timezone','Details']);
+  return 'Setup complete: ' + ss.getUrl();
+}
+
+/** Set a strong password in Script Properties. Run once, then remove this function if desired. */
+function setAdminPasswordOnce() {
+  const password = 'REPLACE-WITH-YOUR-OWN-UNIQUE-STRONG-PASSWORD-16-PLUS-CHARS';
+  if (password.indexOf('REPLACE-') === 0 || password.length < 16) {
+    throw new Error('पहले function में अपना unique 16+ character password डालें।');
+  }
+  PropertiesService.getScriptProperties().setProperty('ADMIN_PASSWORD_HASH', sha256_(password));
+  return 'Admin password hash saved. अब source में plaintext password हटाकर function को दोबारा न चलाएँ।';
+}
+
+function adminLogin(password) {
+  const saved = PropertiesService.getScriptProperties().getProperty('ADMIN_PASSWORD_HASH');
+  if (!saved) throw new Error('Admin password set नहीं है। setAdminPasswordOnce() configure करके एक बार चलाएँ।');
+  if (sha256_(String(password || '')) !== saved) throw new Error('गलत Admin Password');
+  const token = Utilities.getUuid() + Utilities.getUuid();
+  CacheService.getScriptCache().put('ADM_' + token, '1', CFG.SESSION_SECONDS);
+  return {ok:true, token:token};
+}
+
+function adminLogout(token) {
+  if (token) CacheService.getScriptCache().remove('ADM_' + token);
+  return {ok:true};
+}
+
+function adminList(token) {
+  requireAdmin_(token);
+  const sh = sheet_();
+  const values = sh.getDataRange().getValues();
+  if (values.length < 2) return [];
+  const h = headerMap_(values[0]);
+  return values.slice(1).map((r,i) => ({
+    row:i+2,
+    last4:String(r[h.KeyLast4] || ''), customer:String(r[h.CustomerName] || ''),
+    email:String(r[h.Email] || ''), phone:String(r[h.Phone] || ''), company:String(r[h.Company] || ''),
+    orderId:String(r[h.OrderID] || ''), scope:String(r[h.ProductScope] || ''), plan:String(r[h.Plan] || ''),
+    domain:String(r[h.Domain] || ''), status:String(r[h.Status] || ''),
+    created:dateText_(r[h.CreatedAt]), expiry:dateText_(r[h.ExpiryAt]),
+    activated:dateText_(r[h.ActivatedAt]), verified:dateText_(r[h.LastVerifiedAt]),
+    activationCount:Number(r[h.ActivationCount] || 0), lastDomainSeen:String(r[h.LastDomainSeen] || ''),
+    lastUserAgent:String(r[h.LastUserAgent] || ''), lastPageURL:String(r[h.LastPageURL] || ''),
+    lastLanguage:String(r[h.LastLanguage] || ''), lastTimezone:String(r[h.LastTimezone] || ''),
+    notes:String(r[h.Notes] || '')
+  })).reverse();
+}
+
+function adminActivity(token, limit) {
+  requireAdmin_(token);
+  const ss = spreadsheet_();
+  const sh = ss.getSheetByName(CFG.LOG_SHEET);
+  if (!sh || sh.getLastRow() < 2) return [];
+  return sh.getDataRange().getValues().slice(1).reverse()
+    .slice(0, Math.min(Math.max(Number(limit) || 300, 1), 1000))
+    .map(r => ({time:dateText_(r[0]), event:String(r[1]||''), last4:String(r[2]||''),
+      customer:String(r[3]||''), email:String(r[4]||''), domain:String(r[5]||''),
+      status:String(r[6]||''), page:String(r[7]||''), ua:String(r[8]||''),
+      language:String(r[9]||''), timezone:String(r[10]||''), details:String(r[11]||'')}));
+}
+
+function adminGenerate(token, data) {
+  requireAdmin_(token);
+  data = data || {};
+  const domain = normalizeDomain_(data.domain);
+  if (!domain) throw new Error('Domain अनिवार्य है।');
+  const key = 'BLOG-' + randomPart_() + '-' + randomPart_() + '-' + randomPart_() + '-' + randomPart_();
+  const now = new Date();
+  const expiry = parseExpiry_(data.expiry);
+  const record = {
+    KeyHash:sha256_(key), KeyLast4:key.slice(-4), CustomerName:String(data.customer || 'Customer'),
+    Email:String(data.email || ''), ProductScope:String(data.scope || 'Blogger Theme'), Domain:domain,
+    Status:'ACTIVE', CreatedAt:now, ExpiryAt:expiry, ActivatedAt:'', LastVerifiedAt:'',
+    Notes:String(data.notes || ''), Phone:String(data.phone || ''), Company:String(data.company || ''),
+    OrderID:String(data.orderId || ''), Plan:String(data.plan || 'Standard'), ActivationCount:0,
+    LastDomainSeen:'', LastUserAgent:'', LastPageURL:'', LastLanguage:'', LastTimezone:''
+  };
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try { appendRecord_(sheet_(), record); } finally { lock.releaseLock(); }
+  logEvent_('LICENSE_CREATED', record, domain, {}, 'License generated by Admin');
+  // Full key is returned only once. Only SHA-256 hash is stored in the Sheet.
+  return {ok:true, key:key, last4:key.slice(-4), domain:domain, customer:record.CustomerName};
+}
+
+function adminReset(token, row) {
+  requireAdmin_(token);
+  const sh = sheet_(); row = validRow_(row, sh); const h = getSheetHeaders_(sh);
+  setByHeader_(sh,row,h,'Status','ACTIVE');
+  clearByHeader_(sh,row,h,['ActivatedAt','LastVerifiedAt']);
+  logRowEvent_('LICENSE_RESET',sh,row,'License reset by Admin');
+  return {ok:true,message:'License reset. Assigned domain पर फिर activate किया जा सकता है।'};
+}
+
+function adminDeactivate(token, row) {
+  requireAdmin_(token);
+  const sh = sheet_(); row = validRow_(row, sh); const h = getSheetHeaders_(sh);
+  setByHeader_(sh,row,h,'Status','INACTIVE');
+  logRowEvent_('LICENSE_DEACTIVATED',sh,row,'License deactivated by Admin');
+  return {ok:true,message:'License deactivated.'};
+}
+
+function adminChangeDomain(token, row, newDomain) {
+  requireAdmin_(token);
+  const sh = sheet_(); row = validRow_(row, sh); const h = getSheetHeaders_(sh);
+  const domain = normalizeDomain_(newDomain);
+  if (!domain) throw new Error('नया Domain डालें।');
+  setByHeader_(sh,row,h,'Domain',domain);
+  setByHeader_(sh,row,h,'Status','ACTIVE');
+  clearByHeader_(sh,row,h,['ActivatedAt','LastVerifiedAt']);
+  logRowEvent_('DOMAIN_CHANGED',sh,row,'Domain changed to ' + domain);
+  return {ok:true,message:'Domain updated to ' + domain};
+}
+
+function adminRemoveDomain(token, row) {
+  requireAdmin_(token);
+  const sh = sheet_(); row = validRow_(row, sh); const h = getSheetHeaders_(sh);
+  setByHeader_(sh,row,h,'Domain','');
+  setByHeader_(sh,row,h,'Status','UNASSIGNED');
+  clearByHeader_(sh,row,h,['ActivatedAt','LastVerifiedAt']);
+  logRowEvent_('DOMAIN_REMOVED',sh,row,'Domain removed by Admin');
+  return {ok:true,message:'Domain removed. अब Change Domain से नया domain assign करें।'};
+}
+
+/** Public endpoint: visitors are checked by domain only; no visitor license key is required. */
+function publicAction_(p) {
+  const action = String(p.action || '').toLowerCase();
+  if (action === 'check') return publicCheckDomain_(p);
+
+  const key = String(p.key || '').trim().toUpperCase();
+  const domain = normalizeDomain_(p.domain);
+  if (action !== 'activate' && action !== 'verify') return {ok:false,message:'Invalid action.'};
+  if (!key || !domain) return {ok:false,message:'License key और domain आवश्यक हैं।'};
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    const sh = sheet_();
+    const rows = sh.getDataRange().getValues();
+    if (rows.length < 2) return {ok:false,message:'Invalid license key.'};
+    const h = headerMap_(rows[0]);
+    const hash = sha256_(key);
+
+    for (let i=1; i<rows.length; i++) {
+      const r = rows[i];
+      if (String(r[h.KeyHash] || '') !== hash) continue;
+      const row = i + 1;
+      const status = String(r[h.Status] || '').toUpperCase();
+      const rec = rowObject_(r,h);
+
+      if (status === 'INACTIVE') return {ok:false,message:'यह License inactive है। Admin से संपर्क करें।'};
+      if (status !== 'ACTIVE') return {ok:false,message:'यह License active नहीं है। Admin से संपर्क करें।'};
+      if (!String(rec.Domain || '').trim()) return {ok:false,message:'इस License पर कोई Domain assign नहीं है।'};
+      if (normalizeDomain_(rec.Domain) !== domain) {
+        return {ok:false,message:'DOMAIN_MISMATCH: यह License दूसरे domain के लिए registered है।'};
+      }
+      if (rec.ExpiryAt && new Date(rec.ExpiryAt).getTime() < Date.now()) {
+        return {ok:false,message:'LICENSE_EXPIRED: यह License expire हो चुका है।'};
+      }
+
+      const now = new Date();
+      if (action === 'activate' && !rec.ActivatedAt) {
+        sh.getRange(row,h.ActivatedAt+1).setValue(now);
+        sh.getRange(row,h.ActivationCount+1).setValue(Number(rec.ActivationCount || 0) + 1);
+      }
+      sh.getRange(row,h.LastVerifiedAt+1).setValue(now);
+      updateVisitorMetadata_(sh,row,h,domain,p);
+      logEvent_(action === 'activate' ? 'LICENSE_ACTIVATED' : 'LICENSE_VERIFIED',
+        rec,domain,p,'Successful ' + action);
+      return {ok:true,message:'License valid',domain:domain};
+    }
+    return {ok:false,message:'Invalid license key.'};
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Checks whether an ACTIVE, unexpired license is assigned to this domain. */
+function publicCheckDomain_(p) {
+  const domain = normalizeDomain_(p.domain);
+  if (!domain) return {ok:false,code:'INVALID_DOMAIN',message:'Domain पहचान नहीं पाया गया।'};
+
+  const sh = sheet_();
+  const rows = sh.getDataRange().getValues();
+  if (rows.length < 2) return {ok:false,code:'NO_ACTIVE_LICENSE',message:'इस Domain के लिए कोई Active License नहीं मिला।'};
+  const h = headerMap_(rows[0]);
+  let activationRequired = false;
+  let expired = false;
+
+  for (let i=1; i<rows.length; i++) {
+    const r = rows[i];
+    if (normalizeDomain_(r[h.Domain]) !== domain) continue;
+    const status = String(r[h.Status] || '').toUpperCase();
+    if (status !== 'ACTIVE') continue;
+    const rec = rowObject_(r,h);
+    if (!rec.ActivatedAt) { activationRequired = true; continue; }
+    if (rec.ExpiryAt && new Date(rec.ExpiryAt).getTime() < Date.now()) { expired = true; continue; }
+
+    const now = new Date();
+    sh.getRange(i+1,h.LastVerifiedAt+1).setValue(now);
+    updateVisitorMetadata_(sh,i+1,h,domain,p);
+    return {ok:true,code:'DOMAIN_LICENSE_ACTIVE',message:'Domain license active',domain:domain};
+  }
+
+  if (expired) return {ok:false,code:'LICENSE_EXPIRED',message:'LICENSE_EXPIRED: इस Domain का License expire हो चुका है।'};
+  if (activationRequired) return {ok:false,code:'ACTIVATION_REQUIRED',message:'इस Domain पर पहली बार License Key डालकर Activate करें।'};
+  return {ok:false,code:'NO_ACTIVE_LICENSE',message:'इस Domain के लिए कोई Active License नहीं मिला।'};
+}
+
+function updateVisitorMetadata_(sh,row,h,domain,p) {
+  if (h.LastDomainSeen != null) sh.getRange(row,h.LastDomainSeen+1).setValue(domain);
+  if (h.LastUserAgent != null) sh.getRange(row,h.LastUserAgent+1).setValue(String(p.ua || '').slice(0,500));
+  if (h.LastPageURL != null) sh.getRange(row,h.LastPageURL+1).setValue(String(p.page || '').slice(0,1500));
+  if (h.LastLanguage != null) sh.getRange(row,h.LastLanguage+1).setValue(String(p.lang || '').slice(0,80));
+  if (h.LastTimezone != null) sh.getRange(row,h.LastTimezone+1).setValue(String(p.tz || '').slice(0,100));
+}
+
+function ensureHeaders_(sh, headers) {
+  if (sh.getLastColumn() === 0 || sh.getLastRow() === 0) {
+    sh.getRange(1,1,1,headers.length).setValues([headers]);
+  } else {
+    const lastCol = Math.max(sh.getLastColumn(),1);
+    const existing = sh.getRange(1,1,1,lastCol).getValues()[0].map(String);
+    headers.forEach(name => {
+      if (existing.indexOf(name) === -1) {
+        existing.push(name);
+        sh.getRange(1,existing.length).setValue(name);
+      }
+    });
+  }
+  sh.setFrozenRows(1);
+  sh.getRange(1,1,1,sh.getLastColumn()).setFontWeight('bold').setBackground('#eaf0fb');
+}
+function headerMap_(headers) { const m={}; headers.forEach((v,i)=>m[String(v)]=i); return m; }
+function getSheetHeaders_(sh) { return headerMap_(sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0]); }
+function setByHeader_(sh,row,h,name,value) { if (h[name] == null) throw new Error('Sheet में column missing है: '+name); sh.getRange(row,h[name]+1).setValue(value); }
+function clearByHeader_(sh,row,h,names) { names.forEach(name=>{if(h[name]!=null)sh.getRange(row,h[name]+1).clearContent();}); }
+function appendRecord_(sh,obj) {
+  const headers=sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  sh.appendRow(headers.map(h=>Object.prototype.hasOwnProperty.call(obj,h)?obj[h]:''));
+}
+function rowObject_(r,h) { const o={}; Object.keys(h).forEach(k=>o[k]=r[h[k]]); return o; }
+function logEvent_(event,rec,domain,p,details) {
+  try {
+    const ss=spreadsheet_();
+    let sh=ss.getSheetByName(CFG.LOG_SHEET);
+    if(!sh){setupSystem();sh=ss.getSheetByName(CFG.LOG_SHEET);}
+    sh.appendRow([new Date(),event,String(rec.KeyLast4||''),String(rec.CustomerName||''),String(rec.Email||''),String(domain||rec.Domain||''),String(rec.Status||''),String(p.page||''),String(p.ua||''),String(p.lang||''),String(p.tz||''),String(details||'')]);
+  } catch(err) { console.error(err); }
+}
+function logRowEvent_(event,sh,row,details) {
+  const headers=sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0];
+  const h=headerMap_(headers); const r=sh.getRange(row,1,1,sh.getLastColumn()).getValues()[0];
+  logEvent_(event,rowObject_(r,h),r[h.Domain]||'',{},details);
+}
+function spreadsheet_() {
+  const id = PropertiesService.getScriptProperties().getProperty('LICENSE_SPREADSHEET_ID');
+  const active = SpreadsheetApp.getActiveSpreadsheet();
+  if (active) return active;
+  if (id) return SpreadsheetApp.openById(id);
+  throw new Error('Spreadsheet not configured. पहले bound Sheet में setupSystem() चलाएँ।');
+}
+function sheet_() {
+  const ss=spreadsheet_();
+  let sh=ss.getSheetByName(CFG.SHEET_NAME);
+  if(!sh){setupSystem();sh=ss.getSheetByName(CFG.SHEET_NAME);}
+  ensureHeaders_(sh,CFG.HEADERS);
+  return sh;
+}
+function requireAdmin_(token) {
+  if(!token || CacheService.getScriptCache().get('ADM_'+token)!=='1') throw new Error('Admin session expired. फिर से login करें।');
+}
+function validRow_(row,sh) {
+  row=Number(row);
+  if(!Number.isInteger(row)||row<2||row>sh.getLastRow()) throw new Error('Invalid license row. Refresh करके दोबारा कोशिश करें।');
+  return row;
+}
+function normalizeDomain_(value) {
+  let d=String(value||'').trim().toLowerCase();
+  d=d.replace(/^https?:\/\//,'').replace(/^www\./,'').replace(/[\/?#].*$/,'').replace(/\.$/,'');
+  return d;
+}
+function randomPart_() { return Utilities.getUuid().replace(/-/g,'').substring(0,4).toUpperCase(); }
+function sha256_(s) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,String(s),Utilities.Charset.UTF_8)
+    .map(b=>('0'+((b+256)%256).toString(16)).slice(-2)).join('');
+}
+function dateText_(v) { return v instanceof Date ? Utilities.formatDate(v,Session.getScriptTimeZone(),'dd/MM/yyyy HH:mm') : String(v||''); }
+function parseExpiry_(value) {
+  if (!value) return '';
+  const s=String(value).trim();
+  const m=s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const d=m ? new Date(Number(m[1]),Number(m[2])-1,Number(m[3]),23,59,59,999) : new Date(s);
+  if (isNaN(d.getTime())) throw new Error('Expiry date गलत है।');
+  return d;
+}
